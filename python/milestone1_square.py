@@ -58,6 +58,19 @@ TURN_FINE_PWM = 72.0
 TURN_COARSE_THRESHOLD_DEG = 25.0
 TURN_SETTLE_TOL_DEG = 2.0
 TURN_SETTLE_TICKS = 10          # consecutive in-tolerance 10ms ticks (100ms)
+TURN_BRAKE_RATE_DPS = 30.0      # residual spin rate above which coasting at 0 PWM
+                                 # isn't enough to hold position -- angular momentum
+                                 # keeps carrying it (see TURN_BRAKE_LOOKAHEAD_S).
+TURN_BRAKE_PWM = 84.0
+# Reacting only once heading is already inside the settle tolerance is too
+# late: at the coarse/fine spin rates measured (~150-200 deg/s), the mouse
+# was sailing from +90.5 deg all the way to +114.5 deg before 0 PWM (friction
+# alone) could arrest it -- momentum, not a sign or unit bug. Instead,
+# extrapolate the current gyro rate forward by this lookahead window every
+# tick; once that predicted heading would overshoot the target band, start
+# actively braking (reverse PWM) immediately, well before crossing into the
+# tolerance window, rather than after.
+TURN_BRAKE_LOOKAHEAD_S = 0.15
 TURN_NUDGE_PWM = 70.0
 TURN_NUDGE_MS = 20
 TURN_TIMEOUT_MS = 6000  # was 4000 -- widened by 2s as a diagnostic check on whether the timeout itself is cutting turns short
@@ -208,13 +221,24 @@ def turn_left_90():
     low-battery scale factor can never silently drop it below the motor
     deadband.
 
-    Heading and the timeout budget are tracked against real elapsed time
+    The timeout budget is tracked against real elapsed time
     (uct_mouse.get_ticks_ms(), a wall-clock ms counter available on both
     real hardware and the PC simulator), not an assumed-fixed 10ms step. On
     real hardware uct_mouse.delay_ms() is a busy-poll loop that also
     refreshes sensors internally, so a single "10ms" tick can genuinely take
     longer -- with a fixed-step assumption the timeout was cutting the turn
     off well before the (under-tracked) heading ever reached 90 degrees.
+
+    Heading is a separate matter and is integrated against the FIXED nominal
+    step (DT_S), not that same measured wall-clock gap -- delay_ms(STEP_MS)
+    always performs exactly one exchange with the PC simulator, which steps
+    its own physics by exactly DT_S simulated seconds per exchange (the rate
+    negotiated once via configure(rate=100) in micromouse.py). On a real-time
+    (non-fast-sim) run the measured wall-clock gap is inflated well past
+    STEP_MS by OS sleep granularity, so integrating heading against it
+    overstates the turn versus the simulator's own ground truth -- confirmed
+    via --json-log, where the reported heading read +88 deg while the
+    simulator's actual theta had only reached +59 deg for the same turn.
 
     Power is scaled via turn_battery_scale() rather than battery_scale(): a
     pivot needs much more torque margin than straight driving, and a single
@@ -228,39 +252,51 @@ def turn_left_90():
     scale = turn_battery_scale()
 
     start_ms = uct_mouse.get_ticks_ms()
-    last_sample_ms = start_ms
     last_print_ms = start_ms
     flat_gyro_ticks = 0
     flat_gyro_warned = False
 
     while uct_mouse.get_ticks_ms() - start_ms < TURN_TIMEOUT_MS:
-        # Delay first so dt_s precisely measures the physical movement period
-        # that just elapsed under the previous iteration's motor command.
         uct_mouse.delay_ms(STEP_MS)
 
         now_ms = uct_mouse.get_ticks_ms()
-        # Floored at STEP_MS: a delay_ms(STEP_MS) call is guaranteed to have
-        # advanced the mouse (real or simulated) by at least that much, even
-        # if the wall clock reads back less -- this matters in the
-        # autograder's fast-sim mode, where delay_ms() skips its real sleep
-        # entirely and the wall clock barely moves between iterations.
-        dt_s = max(now_ms - last_sample_ms, STEP_MS) / 1000.0
-        last_sample_ms = now_ms
-
+        # Integrate over the FIXED nominal step (DT_S, same constant
+        # drive_straight() uses), not the measured wall-clock gap. The PC
+        # simulator negotiates a fixed exchange rate via configure(rate=100)
+        # and steps its physics by exactly 1/rate == DT_S seconds per
+        # delay_ms(STEP_MS) exchange, regardless of how long that exchange
+        # actually took on the wall clock. On real-time (non-fast-sim) runs,
+        # OS sleep granularity inflates the measured gap well past STEP_MS
+        # (confirmed via --json-log: reported heading hit +88 deg while the
+        # simulator's own ground-truth theta had only reached +59 deg for the
+        # same turn) -- integrating against that inflated gap overstates the
+        # heading beyond what actually happened, letting the mouse hand
+        # control back believing it's on-heading when it is not. STEP_MS is
+        # unaffected: delay_ms(STEP_MS) always performs exactly one exchange.
         gyro_dps = uct_mouse.get_gyro() - GYRO_BIAS_DPS
-        heading_deg += gyro_dps * dt_s
+        heading_deg += gyro_dps * DT_S
         error = TURN_TARGET_DEG - heading_deg
 
         if now_ms - last_print_ms >= 100:
             print(f"  heading={heading_deg:+.1f} deg")
             last_print_ms = now_ms
 
-        if abs(error) <= TURN_SETTLE_TOL_DEG:
+        predicted_heading = heading_deg + gyro_dps * TURN_BRAKE_LOOKAHEAD_S
+        will_overshoot = predicted_heading > TURN_TARGET_DEG + TURN_SETTLE_TOL_DEG
+
+        if abs(error) <= TURN_SETTLE_TOL_DEG and abs(gyro_dps) <= TURN_BRAKE_RATE_DPS:
             uct_mouse.set_motors(0, 0)
             settle_count += 1
             if settle_count >= TURN_SETTLE_TICKS:
                 settled = True
                 break
+        elif will_overshoot or (abs(error) <= TURN_SETTLE_TOL_DEG and abs(gyro_dps) > TURN_BRAKE_RATE_DPS):
+            # Momentum is about to (or already did) carry heading past the
+            # target band -- actively brake (reverse PWM) instead of either
+            # continuing to drive toward target or coasting at 0 PWM.
+            settle_count = 0
+            brake = max(MIN_ACTIVE_PWM, TURN_BRAKE_PWM * scale)
+            uct_mouse.set_motors(int(brake), int(-brake))
         else:
             # Always keep driving (never idle at 0,0) while outside tolerance:
             # sitting at zero PWM mid-turn holds the mouse motionless, and the
@@ -294,16 +330,15 @@ def turn_left_90():
         uct_mouse.set_motors(int(-spin * direction), int(spin * direction))
         uct_mouse.delay_ms(TURN_NUDGE_MS)
 
-        now_ms = uct_mouse.get_ticks_ms()
-        dt_s = max(now_ms - last_sample_ms, TURN_NUDGE_MS) / 1000.0
-        last_sample_ms = now_ms
+        # TURN_NUDGE_MS / 1000.0 -- see the fixed-dt note in the main loop
+        # above; delay_ms(TURN_NUDGE_MS) always performs TURN_NUDGE_MS/STEP_MS
+        # exchanges of exactly DT_S simulated seconds each.
         gyro_dps = uct_mouse.get_gyro() - GYRO_BIAS_DPS
-        heading_deg += gyro_dps * dt_s
+        heading_deg += gyro_dps * (TURN_NUDGE_MS / 1000.0)
         print(f"  heading={heading_deg:+.1f} deg (nudge)")
 
         uct_mouse.set_motors(0, 0)
         uct_mouse.delay_ms(STEP_MS)
-        last_sample_ms = uct_mouse.get_ticks_ms()
 
     uct_mouse.set_motors(0, 0)
 
