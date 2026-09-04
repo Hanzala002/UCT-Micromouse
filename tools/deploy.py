@@ -77,32 +77,52 @@ def find_dfu_util_cmd():
     for cmd in ["dfu-util", "/opt/homebrew/bin/dfu-util", "/usr/local/bin/dfu-util", "/opt/local/bin/dfu-util"]:
         if shutil.which(cmd) or os.path.exists(cmd):
             return cmd
-    return None
-
 def find_st_flash_cmd():
-    """Finds the st-flash command path."""
-    for cmd in ["st-flash", "/opt/homebrew/bin/st-flash", "/usr/local/bin/st-flash", "/opt/local/bin/st-flash"]:
+    """Finds the st-flash command path across PATH and Windows install locations."""
+    for cmd in ["st-flash", "st-flash.exe", "/opt/homebrew/bin/st-flash", "/usr/local/bin/st-flash", "/opt/local/bin/st-flash"]:
         if shutil.which(cmd) or os.path.exists(cmd):
             return cmd
+    candidate_patterns = [
+        r"C:\Program Files\stlink*\bin\st-flash.exe",
+        r"C:\Program Files (x86)\stlink*\bin\st-flash.exe",
+        r"C:\tools\stlink*\bin\st-flash.exe",
+        os.path.expanduser(r"~\scoop\apps\stlink\current\bin\st-flash.exe")
+    ]
+    for pat in candidate_patterns:
+        matches = glob.glob(pat)
+        if matches and os.path.isfile(matches[0]):
+            return os.path.abspath(matches[0])
     return None
 
-def is_dfu_device_connected(dfu_util_cmd):
-    """Checks if an STM32 DFU device is currently connected."""
-    try:
-        res = subprocess.run([dfu_util_cmd, "-l"], capture_output=True, text=True)
-        return "0483:df11" in res.stdout
-    except Exception:
-        return False
+def find_stm32_programmer_cli():
+    """Finds STM32_Programmer_CLI (official ST-Link CLI tool on Windows/Mac/Linux)."""
+    for cmd in ["STM32_Programmer_CLI", "STM32_Programmer_CLI.exe"]:
+        if shutil.which(cmd) or os.path.exists(cmd):
+            return cmd
+    candidate_patterns = [
+        r"C:\Program Files\STMicroelectronics\STM32Cube\STM32CubeProgrammer\bin\STM32_Programmer_CLI.exe",
+        r"C:\Program Files (x86)\STMicroelectronics\STM32Cube\STM32CubeProgrammer\bin\STM32_Programmer_CLI.exe",
+        r"C:\ST\STM32CubeCLT*\STM32CubeProgrammer\bin\STM32_Programmer_CLI.exe",
+        r"C:\ST\STM32CubeIDE*\STM32CubeIDE\plugins\com.st.stm32cube.ide.mcu.externaltools.cubeprogrammer.*\tools\bin\STM32_Programmer_CLI.exe",
+        "/Applications/STMicroelectronics/STM32Cube/STM32CubeProgrammer/STM32CubeProgrammer.app/Contents/MacOs/bin/STM32_Programmer_CLI"
+    ]
+    for pat in candidate_patterns:
+        try:
+            matches = glob.glob(pat, recursive=True) if "**" in pat else glob.glob(pat)
+            if matches and os.path.isfile(matches[0]):
+                return os.path.abspath(matches[0])
+        except Exception:
+            pass
+    return None
 
 def flash_firmware(central_bin_path):
     """Flashes the firmware binary onto the board.
-    Tries USB DFU via dfu-util first, then st-flash, and falls back to ST-Link USB mass storage copy.
+    Tries USB DFU via dfu-util first, then st-flash, STM32_Programmer_CLI, and falls back to ST-Link USB mass storage copy.
     """
     dfu_util_cmd = find_dfu_util_cmd()
     if dfu_util_cmd and is_dfu_device_connected(dfu_util_cmd):
         print(f"Using direct USB DFU flash via '{dfu_util_cmd}' (over USB OTG)...")
         try:
-            # 0x08000000 is the flash start address. :leave tells dfu-util to jump to application after programming.
             subprocess.run([
                 dfu_util_cmd, 
                 "-a", "0", 
@@ -114,8 +134,9 @@ def flash_firmware(central_bin_path):
             return True
         except (subprocess.CalledProcessError, FileNotFoundError) as e:
             print(f"Warning: USB DFU flashing failed: {e}")
-            print("Falling back to other flashing methods...")
+            print("Falling back to SWD flashing methods...")
 
+    # 2. Try st-flash
     st_flash_cmd = find_st_flash_cmd()
     if st_flash_cmd:
         print(f"Using direct SWD flash via '{st_flash_cmd}' (fast & reliable)...")
@@ -125,27 +146,142 @@ def flash_firmware(central_bin_path):
             return True
         except (subprocess.CalledProcessError, FileNotFoundError) as e:
             print(f"Warning: Direct flashing via st-flash failed: {e}")
+            print("Trying STM32_Programmer_CLI...")
+
+    # 3. Try STM32_Programmer_CLI (Official ST tool)
+    stm32_cli = find_stm32_programmer_cli()
+    if stm32_cli:
+        print(f"Using direct SWD flash via STM32_Programmer_CLI ('{stm32_cli}')...")
+        try:
+            subprocess.run([
+                stm32_cli, "-c", "port=SWD", "-w", central_bin_path, "0x08000000", "-v", "-rst"
+            ], check=True)
+            print("Success! Firmware flashed via STM32CubeProgrammer. Board reset triggered.")
+            return True
+        except (subprocess.CalledProcessError, FileNotFoundError) as e:
+            print(f"Warning: STM32_Programmer_CLI failed: {e}")
             print("Falling back to USB mass storage copy method...")
             
-    # Fallback: Find the ST-Link Mass Storage Drive
+    # 4. Fallback: Find the ST-Link Mass Storage Drive
     drive = find_stlink_drive()
     if not drive:
-        print("Error: Could not find ST-Link USB drive or st-flash. Is the board plugged in?")
+        print("\nError: Could not find ST-Link programmer or USB drive.")
+        print("Please ensure the ST-Link USB cable is firmly plugged in and the LED is lit.")
+        print("To install reliable command-line flashers on Windows:")
+        print("  winget install STMicroelectronics.STM32CubeProgrammer")
         sys.exit(1)
         
-    print(f"ST-Link found at {drive}. Flashing via USB mass storage copy (slower, may hang)...")
+    print(f"ST-Link found at {drive}. Flashing via USB mass storage stream write...")
     try:
-        if sys.platform == 'darwin':
-            dest_path = os.path.join(drive, "firmware.bin")
-            with open(central_bin_path, "rb") as f_src, open(dest_path, "wb") as f_dst:
-                f_dst.write(f_src.read())
-        else:
-            shutil.copy(central_bin_path, drive)
+        dest_path = os.path.join(drive, "firmware.bin")
+        # Remove old firmware.bin or failed transfer artifacts if present
+        for old_f in ["firmware.bin", "FAIL.TXT"]:
+            old_p = os.path.join(drive, old_f)
+            if os.path.exists(old_p):
+                try:
+                    os.remove(old_p)
+                except Exception:
+                    pass
+                    
+        # Direct raw binary stream write (avoids Windows FAT metadata allocation errors)
+        with open(central_bin_path, "rb") as f_src, open(dest_path, "wb") as f_dst:
+            f_dst.write(f_src.read())
+            f_dst.flush()
+            
         print("Success! Firmware copied to drive. Mouse will automatically reboot.")
         return True
     except Exception as e:
-        print(f"Error copying to mass storage drive: {e}")
+        print(f"Error copying to ST-Link drive: {e}")
+        print("Tip: If the ST-Link virtual drive is full or locked, unplug and replug the ST-Link USB cable.")
         sys.exit(1)
+
+def find_arm_gcc():
+    """Finds arm-none-eabi-gcc executable across PATH and standard OS install directories."""
+    # 1. Direct search on PATH
+    for exe in ["arm-none-eabi-gcc", "arm-none-eabi-gcc.exe"]:
+        p = shutil.which(exe)
+        if p:
+            return os.path.abspath(p)
+            
+    # 2. Search common installation directories
+    candidate_patterns = [
+        # Windows Arm GNU Toolchains (deep search)
+        r"C:\Program Files (x86)\Arm GNU Toolchain*\**\arm-none-eabi-gcc.exe",
+        r"C:\Program Files\Arm GNU Toolchain*\**\arm-none-eabi-gcc.exe",
+        r"C:\Program Files (x86)\GNU Arm Embedded Toolchain*\**\arm-none-eabi-gcc.exe",
+        r"C:\Program Files\GNU Arm Embedded Toolchain*\**\arm-none-eabi-gcc.exe",
+        r"C:\Program Files (x86)\GNU Tools ARM Embedded*\**\arm-none-eabi-gcc.exe",
+        r"C:\Program Files\GNU Tools ARM Embedded*\**\arm-none-eabi-gcc.exe",
+        r"C:\ST\**\arm-none-eabi-gcc.exe",
+        r"C:\tools\**\arm-none-eabi-gcc.exe",
+        os.path.expanduser(r"~\AppData\Local\Programs\**\arm-none-eabi-gcc.exe"),
+        os.path.expanduser(r"~\scoop\apps\**\arm-none-eabi-gcc.exe"),
+        # MATLAB Support Packages (deep search)
+        r"C:\ProgramData\MATLAB\SupportPackages\**\arm-none-eabi-gcc.exe",
+        os.path.expanduser(r"~\AppData\Roaming\MathWorks\**\arm-none-eabi-gcc.exe"),
+        r"C:\Program Files\MATLAB\**\arm-none-eabi-gcc.exe",
+        # Unix/macOS paths
+        "/opt/homebrew/bin/arm-none-eabi-gcc",
+        "/usr/local/bin/arm-none-eabi-gcc",
+        "/opt/local/bin/arm-none-eabi-gcc",
+        "/usr/bin/arm-none-eabi-gcc"
+    ]
+    
+    for pat in candidate_patterns:
+        try:
+            matches = glob.glob(pat, recursive=True) if "**" in pat else glob.glob(pat)
+            if matches:
+                # Ensure the matched file is executable / valid
+                for m in matches:
+                    if os.path.isfile(m):
+                        return os.path.abspath(m)
+        except Exception:
+            pass
+            
+    return None
+
+def get_cmake_toolchain_flags(required=True):
+    """Generates CMake toolchain compiler arguments and ensures arm-none-eabi-gcc is in PATH."""
+    arm_gcc = find_arm_gcc()
+    if not arm_gcc:
+        if required:
+            print("\nError: ARM GCC cross-compiler ('arm-none-eabi-gcc') not found on your system.")
+            print("To compile Simulink or C firmware, please install the ARM GNU toolchain:")
+            print("  Windows (PowerShell): winget install Arm.GnuArmEmbeddedToolchain")
+            print("       or (Chocolatey): choco install make arm-none-eabi-gcc")
+            print("  macOS:                brew install arm-none-eabi-gcc")
+            print("  Linux (Ubuntu/Debian): sudo apt install gcc-arm-none-eabi")
+            sys.exit(1)
+        else:
+            return None
+        
+    gcc_dir = os.path.dirname(arm_gcc)
+    if gcc_dir not in os.environ.get("PATH", ""):
+        os.environ["PATH"] = gcc_dir + os.pathsep + os.environ.get("PATH", "")
+        
+    exe_ext = ".exe" if sys.platform.startswith("win") else ""
+    gxx = os.path.join(gcc_dir, f"arm-none-eabi-g++{exe_ext}")
+    objcopy = os.path.join(gcc_dir, f"arm-none-eabi-objcopy{exe_ext}")
+    size = os.path.join(gcc_dir, f"arm-none-eabi-size{exe_ext}")
+    
+    flags = [
+        f"-DCMAKE_C_COMPILER={arm_gcc.replace(os.sep, '/')}",
+        f"-DCMAKE_ASM_COMPILER={arm_gcc.replace(os.sep, '/')}"
+    ]
+    if os.path.exists(gxx):
+        flags.append(f"-DCMAKE_CXX_COMPILER={gxx.replace(os.sep, '/')}")
+    if os.path.exists(objcopy):
+        flags.append(f"-DCMAKE_OBJCOPY={objcopy.replace(os.sep, '/')}")
+    if os.path.exists(size):
+        flags.append(f"-DCMAKE_SIZE={size.replace(os.sep, '/')}")
+        
+    if sys.platform.startswith("win"):
+        if shutil.which("ninja"):
+            flags += ["-G", "Ninja"]
+        elif shutil.which("mingw32-make") or shutil.which("make"):
+            flags += ["-G", "MinGW Makefiles"]
+            
+    return flags
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="UCT Micromouse Firmware and Script Deployer")
@@ -289,7 +425,8 @@ if __name__ == "__main__":
             
         try:
             print("    -> Configuring CMake...")
-            subprocess.run(["cmake", "-S", "firmware", "-B", "firmware/build"], cwd=repo_root, check=True)
+            toolchain_flags = get_cmake_toolchain_flags()
+            subprocess.run(["cmake", "-S", "firmware", "-B", "firmware/build"] + toolchain_flags, cwd=repo_root, check=True)
             print("    -> Building PikaScript firmware target...")
             subprocess.run(["cmake", "--build", "firmware/build", "--target", "pikascript_firmware"], cwd=repo_root, check=True)
         except subprocess.CalledProcessError:
@@ -314,40 +451,88 @@ if __name__ == "__main__":
 
     elif args.engine == "simulink":
         # === SIMULINK ENGINE FLOW ===
-        # Re-route model build outputs to central build/ directory to keep repo clean
-        simulink_build_dir = os.path.join(repo_root, "build", "UCT_KDeploy_ert_rtw")
+        print("[1/2] Preparing Simulink firmware binary...")
+        
+        # 1. Search for generated Simulink code directory (*_ert_rtw)
+        ert_candidates = []
+        search_roots = [
+            os.path.join(repo_root, "build"),
+            os.path.join(repo_root, "matlab", "simulink"),
+            os.path.join(repo_root, "matlab"),
+            os.path.join(repo_root, "workspace"),
+            repo_root
+        ]
+        
+        for root_path in search_roots:
+            if os.path.exists(root_path):
+                for entry in os.listdir(root_path):
+                    full_p = os.path.join(root_path, entry)
+                    if entry.endswith("_ert_rtw") and os.path.isdir(full_p):
+                        # Verify it contains C sources
+                        c_files = [f for f in os.listdir(full_p) if f.endswith(".c") and f != "ert_main.c"]
+                        if c_files:
+                            mtime = os.path.getmtime(full_p)
+                            ert_candidates.append((mtime, full_p, entry))
+                            
+        selected_ert_dir = None
+        if ert_candidates:
+            # Sort by newest modification time
+            ert_candidates.sort(key=lambda x: x[0], reverse=True)
+            selected_ert_dir = ert_candidates[0][1]
+            model_name = ert_candidates[0][2].replace("_ert_rtw", "")
+            print(f"    -> Found generated Simulink model code: {selected_ert_dir} ({model_name})")
+            
         untracked_bin_path = os.path.join(repo_root, "build", "bin", "simulink.bin")
         tracked_bin_path = os.path.join(repo_root, "firmware", "binaries", "simulink.bin")
+        active_bin_path = None
         
-        # Compile if not present or requested
-        print("[1/2] Preparing Simulink firmware binary...")
-        if not os.path.exists(simulink_build_dir) or args.flash:
-            # We compile by invoking the Simulink build helper script
-            print("    -> Compiling Simulink model code...")
-            compile_script = os.path.join(repo_root, "tools", "compile_simulink_pc.py")
-            if os.path.exists(compile_script):
-                subprocess.run([sys.executable, compile_script], check=True)
-            else:
-                print("Error: Simulink compiler script not found!")
-                sys.exit(1)
+        toolchain_flags = get_cmake_toolchain_flags(required=False)
+        
+        if selected_ert_dir and toolchain_flags is not None:
+            try:
+                print("    -> Configuring CMake for Simulink model...")
+                ert_arg = f"-DSIMULINK_ERT_DIR={selected_ert_dir.replace(os.sep, '/')}"
+                subprocess.run(
+                    ["cmake", "-S", "firmware", "-B", "firmware/build", ert_arg] + toolchain_flags,
+                    cwd=repo_root,
+                    check=True
+                )
+                print("    -> Building Simulink firmware target (ARM cross-compiler)...")
+                subprocess.run(
+                    ["cmake", "--build", "firmware/build", "--target", "simulink_firmware"],
+                    cwd=repo_root,
+                    check=True
+                )
+                built_bin = os.path.join(repo_root, "firmware", "build", "simulink_firmware.bin")
+                if os.path.exists(built_bin):
+                    os.makedirs(os.path.dirname(untracked_bin_path), exist_ok=True)
+                    shutil.copy(built_bin, untracked_bin_path)
+                    shutil.copy(built_bin, tracked_bin_path)
+                    active_bin_path = untracked_bin_path
+                    print(f"    -> Successfully compiled fresh binary to {untracked_bin_path}")
+            except subprocess.CalledProcessError as e:
+                print(f"    -> Note: CMake build encountered: {e}")
 
-        sim_bin = os.path.join(simulink_build_dir, "UCT_KDeploy.bin")
-        if not os.path.exists(sim_bin):
-            # Fall back to checking standard directories
-            sim_bin = os.path.join(repo_root, "UCT_KDeploy_ert_rtw", "UCT_KDeploy.bin")
-            
-        if not os.path.exists(sim_bin):
-            if os.path.exists(tracked_bin_path):
-                print(f"Using precompiled release binary: {tracked_bin_path}")
+        # 1. Check if MATLAB generated a .bin file directly inside the ert_rtw folder
+        if selected_ert_dir and not active_bin_path:
+            for f in os.listdir(selected_ert_dir):
+                if f.endswith(".bin"):
+                    direct_bin = os.path.join(selected_ert_dir, f)
+                    print(f"    -> Found direct binary in model folder: {direct_bin}")
+                    active_bin_path = direct_bin
+                    break
+
+        if not active_bin_path:
+            if os.path.exists(untracked_bin_path):
+                print(f"    -> Flashing compiled model binary: {untracked_bin_path}")
+                active_bin_path = untracked_bin_path
+            elif os.path.exists(tracked_bin_path):
+                print(f"    -> Flashing firmware release binary: {tracked_bin_path}")
                 active_bin_path = tracked_bin_path
             else:
-                print(f"Error: Compiled Simulink binary not found. Please build model first.")
+                print("Error: No Simulink firmware binary found.")
+                print("Please build your Simulink model in MATLAB (Cmd+B) or install arm-none-eabi-gcc.")
                 sys.exit(1)
-        else:
-            os.makedirs(os.path.dirname(untracked_bin_path), exist_ok=True)
-            shutil.copy(sim_bin, untracked_bin_path)
-            print(f"    -> Copied compiled binary to {untracked_bin_path}")
-            active_bin_path = untracked_bin_path
 
         # Flash the compiled firmware onto the board
         print(f"[2/2] Flashing Simulink firmware...")
@@ -468,13 +653,15 @@ if __name__ == "__main__":
                 print("[2/2] Performing Factory Reset: Formatting external SPI flash filesystem...")
                 format_script = (
                     "import os, pyb\n"
+                    "try: os.umount('/flash')\n"
+                    "except: pass\n"
                     "f = pyb.Flash()\n"
                     "print('Formatting FAT partition...')\n"
                     "os.VfsFat.mkfs(f)\n"
                     "vfs = os.VfsFat(f)\n"
                     "os.mount(vfs, '/flash')\n"
                     "with open('/flash/boot.py', 'w') as fp:\n"
-                    "    fp.write('# boot.py -- run on boot-up\\n')\n"
+                    "    fp.write('# boot.py - UCT Micromouse Hybrid Bootloader\\ntry:\\n    import pyb\\n    pyb.usb_mode(\\'VCP+MSC\\')\\nexcept Exception as e:\\n    pass\\n')\n"
                     "with open('/flash/main.py', 'w') as fp:\n"
                     "    fp.write('# main.py -- put your code here!\\n')\n"
                     "print('Flash formatted and mounted successfully!')\n"

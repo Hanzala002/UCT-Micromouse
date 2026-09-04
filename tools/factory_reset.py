@@ -144,7 +144,7 @@ def main():
                 "vfs = os.VfsFat(f)\n"
                 "os.mount(vfs, '/flash')\n"
                 "with open('/flash/boot.py', 'w') as fp:\n"
-                "    fp.write('# boot.py -- run on boot-up\\n')\n"
+                "    fp.write('# boot.py - UCT Micromouse Hybrid Bootloader\\ntry:\\n    import pyb\\n    pyb.usb_mode(\\'VCP+MSC\\')\\nexcept Exception as e:\\n    pass\\n')\n"
                 "with open('/flash/main.py', 'w') as fp:\n"
                 "    fp.write('# main.py -- put your code here!\\n')\n"
                 "with open('/flash/README.txt', 'w') as fp:\n"
@@ -173,7 +173,7 @@ def main():
                     time.sleep(0.1)
                     s.write(b'os.mount(vfs, \"/flash\")\r\n')
                     time.sleep(0.2)
-                    s.write(b'with open(\"/flash/boot.py\", \"w\") as fp: fp.write(\"# boot.py -- run on boot-up\\n\")\r\n')
+                    s.write(b'with open(\"/flash/boot.py\", \"w\") as fp: fp.write(\"# boot.py - UCT Micromouse Hybrid Bootloader\\ntry:\\n    import pyb\\n    pyb.usb_mode(\'VCP+MSC\')\\nexcept Exception as e:\\n    pass\\n\")\r\n')
                     time.sleep(0.2)
                     s.write(b'with open(\"/flash/main.py\", \"w\") as fp: fp.write(\"# main.py -- put your code here!\\n\")\r\n')
                     time.sleep(0.2)
@@ -208,7 +208,7 @@ def main():
         if mpy_drive:
             try:
                 with open(os.path.join(mpy_drive, "boot.py"), "w") as fp:
-                    fp.write("# boot.py -- run on boot-up\n")
+                    fp.write("# boot.py - UCT Micromouse Hybrid Bootloader\ntry:\n    import pyb\n    pyb.usb_mode('VCP+MSC')\nexcept Exception as e:\n    pass\n")
                 with open(os.path.join(mpy_drive, "main.py"), "w") as fp:
                     fp.write("# main.py -- put your code here!\n")
                 with open(os.path.join(mpy_drive, "README.txt"), "w") as fp:

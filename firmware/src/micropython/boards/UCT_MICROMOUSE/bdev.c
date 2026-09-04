@@ -216,6 +216,11 @@ int uct_bdev_writeblocks(const uint8_t *src, uint32_t block_num, uint32_t num_bl
         bdev_last_write_tick = HAL_GetTick();
     }
 
+    // Direct synchronous write-through: flush dirty sector to physical flash immediately
+    if (ret == 0) {
+        ret = ext_flash_flush();
+    }
+
     ext_flash_busy = false;
     return ret;
 }
