@@ -112,7 +112,7 @@ class MazeSolver:
                 if len(lines) >= 4:
                     uct_mouse.set_encoder_polarity(int(lines[2]), int(lines[3]))
         except Exception:
-            uct_mouse.set_polarity(1, 1)
+            uct_mouse.set_polarity(-1, -1)
 
         print("--- Milestone 2: 100% Maze Exploration ---")
         
